@@ -1,0 +1,11 @@
+**
+!requirements.txt
+!app/
+!app/**
+!scripts/
+!scripts/serve.py
+app/**/__pycache__/
+app/**/*.pyc
+app/**/.env*
+app/**/*.sqlite*
+app/**/*.db

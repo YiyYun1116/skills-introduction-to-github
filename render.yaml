@@ -1,0 +1,32 @@
+# Review the billable service and disk in Render before creating resources.
+services:
+  - type: web
+    name: signal-atlas
+    runtime: python
+    plan: starter
+    numInstances: 1
+    buildCommand: python -m pip install --no-cache-dir -r requirements.txt
+    startCommand: python scripts/serve.py
+    healthCheckPath: /api/health
+    disk:
+      name: signal-atlas-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.12
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: SIGNAL_ATLAS_ENV
+        value: production
+      - key: SIGNAL_ATLAS_DB
+        value: /var/data/signal-atlas.sqlite3
+      - key: SIGNAL_ATLAS_SYNC_MINUTES
+        value: "30"
+      - key: SIGNAL_ATLAS_ACCESS_USER
+        value: research
+      - key: SIGNAL_ATLAS_ACCESS_PASSWORD
+        generateValue: true
+      # Only the managed Render ingress should connect to this service.
+      - key: FORWARDED_ALLOW_IPS
+        value: "*"

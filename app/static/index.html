@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#123c34">
+  <meta name="description" content="溯源 Signal Atlas：追踪公开金融信息、聚合同题证据，建立可核查的全球多资产研究工作流。">
+  <title>溯源 · Signal Atlas — 全球金融情报</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <svg class="icon-defs" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+    <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol>
+    <symbol id="i-layers" viewBox="0 0 24 24"><path d="m12 3 10 5-10 5L2 8zM2 12l10 5 10-5M2 16l10 5 10-5"/></symbol>
+    <symbol id="i-book" viewBox="0 0 24 24"><path d="M12 6v15M3 3c4-1 7 0 9 3 2-3 5-4 9-3v15c-4-1-7 0-9 3-2-3-5-4-9-3z"/></symbol>
+    <symbol id="i-star" viewBox="0 0 24 24"><path d="m12 3 2.8 5.8 6.4.9-4.6 4.5 1.1 6.3-5.7-3-5.7 3 1.1-6.3-4.6-4.5 6.4-.9z"/></symbol>
+    <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a17 17 0 0 1 0 18 17 17 0 0 1 0-18z"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 7a7 7 0 0 1 11.6-1L20 9M4 15l2.3 3A7 7 0 0 0 18 17"/></symbol>
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14m-6-6 6 6-6 6"/></symbol>
+    <symbol id="i-external" viewBox="0 0 24 24"><path d="M14 3h7v7m0-7L10 14M10 3H4a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h16a1 1 0 0 0 1-1v-6"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="m12 2 8 4v6c0 5-8 10-8 10S4 17 4 12V6z"/><path d="m8 12 3 3 5-6"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5"/></symbol>
+    <symbol id="i-trend" viewBox="0 0 24 24"><path d="m3 17 6-6 4 4 8-10m-6 0h6v6"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+    <symbol id="i-filter" viewBox="0 0 24 24"><path d="M4 6h16M7 12h10M10 18h4"/></symbol>
+    <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7v1"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/></symbol>
+  </svg>
+  <a class="skip-link" href="#main-content">跳转到主要内容</a>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar" aria-label="主要导航">
+      <a class="brand" href="#overview" aria-label="溯源，情报总览">
+        <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+        <span><strong>溯源<span class="brand-dot">.</span></strong><small>SIGNAL ATLAS</small></span>
+      </a>
+      <div class="workspace-label">个人研究工作台 <span class="workspace-pill">GLOBAL</span></div>
+      <nav class="nav-list">
+        <a href="#overview" class="nav-item active" data-view="overview"><svg class="icon"><use href="#i-grid"/></svg><span>情报总览</span><span class="nav-dot"></span></a>
+        <a href="#themes" class="nav-item" data-view="themes"><svg class="icon"><use href="#i-layers"/></svg><span>主题聚合</span><span id="nav-topic-count" class="nav-count">—</span></a>
+        <a href="#research" class="nav-item" data-view="research"><svg class="icon"><use href="#i-book"/></svg><span>研究与论文</span></a>
+        <a href="#watchlist" class="nav-item" data-view="watchlist"><svg class="icon"><use href="#i-star"/></svg><span>关注资产</span></a>
+        <div class="nav-separator"></div>
+        <a href="#sources" class="nav-item" data-view="sources"><svg class="icon"><use href="#i-globe"/></svg><span>数据来源</span><span class="tiny-status"></span></a>
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="research-note"><div class="note-icon"><svg class="icon"><use href="#i-shield"/></svg></div><strong>好的判断，从可靠的信息开始。</strong><p>追溯原始出处，连接独立证据，保留每一份不确定性。</p><a href="#sources">了解来源体系 <span>↗</span></a></div>
+        <div class="workspace-profile"><span class="avatar">研</span><div><strong>我的研究空间</strong><span>公开数据 · 全球视野</span></div><svg class="icon"><use href="#i-globe"/></svg></div>
+      </div>
+    </aside>
+    <div class="main-shell">
+      <header class="topbar">
+        <button class="icon-button mobile-menu" id="mobile-menu" aria-label="打开导航" aria-expanded="false"><svg class="icon"><use href="#i-menu"/></svg></button>
+        <div class="breadcrumbs">研究工作台 <span>/</span> <strong id="breadcrumb-current">情报总览</strong></div>
+        <label class="global-search"><svg class="icon"><use href="#i-search"/></svg><input id="global-search" type="search" placeholder="搜索话题、公司、政策或关键词…" aria-label="搜索信息"><kbd>/</kbd></label>
+        <button class="mode-switch" id="mode-switch" title="切换真实公开数据与演示数据"><span class="status-dot"></span><span id="mode-label">连接中</span><span class="switch-arrow">⌄</span></button>
+        <span class="header-avatar" title="个人研究空间">研</span>
+      </header>
+      <main id="main-content" tabindex="-1">
+        <div id="global-notice" role="status" aria-live="polite"></div>
+        <div id="page-content"><div class="initial-loading"><span class="loading-orbit"></span><h1>正在连接你的情报工作台</h1><p>读取公开信息、来源与主题索引…</p></div></div>
+      </main>
+      <footer class="app-footer"><span>溯源 SIGNAL ATLAS <span class="footer-sep">·</span> 每一条信息，都有出处。</span><span>情绪反映文本表述；情景分析不代表确定预测或投资建议。</span></footer>
+    </div>
+  </div>
+  <div id="drawer-root"></div>
+  <div class="toast-container" id="toast-container" aria-live="polite" aria-atomic="true"></div>
+</body>
+</html>
