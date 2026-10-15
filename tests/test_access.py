@@ -24,7 +24,7 @@ class AccessTests(unittest.TestCase):
     def test_website_and_private_data_require_password_but_health_is_public(self):
         with TestClient(app) as client:
             self.assertEqual(client.get('/api/health').status_code,200)
-            for path in ['/','/api/dashboard','/api/watchlist','/api/export','/static/app.js','/docs']:
+            for path in ['/','/api/dashboard','/api/diagnostics','/api/watchlist','/api/export','/static/app.js','/docs']:
                 response=client.get(path)
                 self.assertEqual(response.status_code,401,path)
                 self.assertIn('Basic',response.headers['WWW-Authenticate'])

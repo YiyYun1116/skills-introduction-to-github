@@ -19,7 +19,83 @@ def article(identifier, **kwargs):
             "topic_key": "fed-rate", "kind": "policy", "is_demo": False, **kwargs}
 
 
+def filing(identifier, **kwargs):
+    values = dict(kind="filing", title="10-Q - ACME CORP", summary="Quarterly report filing index.",
+                  source_id="fed", topic_key="", entities=["ACME CORP"], tags=["company_filings"],
+                  asset_classes=["equity"], published_at=None, announced_at="2026-10-12T20:30:00Z",
+                  accepted_at="2026-10-12T20:30:00Z", date_basis="filing_accepted",
+                  filing_form="10-Q", company_name="ACME CORP", company_cik="0000000001",
+                  accession_number="0000000001-26-000001", filing_date="2026-10-12")
+    values.update(kwargs)
+    return article(identifier, **values)
+
+
 class AnalysisTests(unittest.TestCase):
+    def test_publisher_alternative_hosts_must_be_explicit(self):
+        source = dict(SOURCES[0],id='bbc',url='https://www.bbc.co.uk/news/business',
+                      article_hosts=['www.bbc.co.uk','www.bbc.com'])
+        for host,expected in [('www.bbc.com',True),('www.bbc.co.uk',True),('bbc.com.evil.example',False),('evil.bbc.com',False)]:
+            row = article('report',source_id='bbc',url='https://'+host+'/news/report')
+            result = analyze_articles([row],[source])[0]['articles'][0]
+            self.assertEqual(result['source_domain_match'],expected,host)
+
+    def test_filing_acceptance_retains_correct_time_basis(self):
+        cluster=analyze_articles([filing('filing')],SOURCES)[0]
+        self.assertEqual(cluster['latest_at'],'2026-10-12T20:30:00Z')
+        self.assertEqual(cluster['latest_date_basis'],'filing_accepted')
+        self.assertEqual(cluster['articles'][0]['activity_date_basis'],'filing_accepted')
+        self.assertEqual(cluster['articles'][0]['published_at'],'')
+        self.assertFalse(any('论文订阅' in note for note in cluster['verification']['limitations']))
+        self.assertFalse(any('无法确认信息时效' in note for note in cluster['verification']['limitations']))
+        self.assertTrue(any('报告期末' in note for note in cluster['verification']['limitations']))
+        self.assertIn('索引',cluster['scenario']['base'])
+        self.assertIn('暂不判断',cluster['scenario']['base'])
+
+    def test_filing_announced_fallback_preserves_acceptance_basis(self):
+        cluster=analyze_articles([filing('filing',accepted_at=None)],SOURCES)[0]
+        self.assertEqual(cluster['latest_date_basis'],'filing_accepted')
+        self.assertEqual(cluster['articles'][0]['accepted_at'],'')
+        self.assertEqual(cluster['latest_at'],'2026-10-12T20:30:00Z')
+
+    def test_distinct_filing_accessions_stay_separate_even_with_shared_topic_key(self):
+        rows=[filing('q1',topic_key='acme-earnings'),
+              filing('q2',topic_key='acme-earnings',accession_number='0000000001-26-000002')]
+        clusters=analyze_articles(rows,SOURCES)
+        self.assertEqual(len(clusters),2)
+        self.assertEqual(len({item['id'] for item in clusters}),2)
+        self.assertTrue(all(item['duplicate_count']==0 for item in clusters))
+
+    def test_company_and_form_metadata_prevent_false_filing_identity(self):
+        variants=[dict(company_cik='0000000002',company_name='ACRE CORP'),dict(filing_form='10-Q/A'),
+                  dict(reporting_period='2026-06-30')]
+        for variant in variants:
+            with self.subTest(variant=variant):
+                rows=[filing('one',reporting_period='2026-03-31'),filing('two',**variant)]
+                clusters=analyze_articles(rows,SOURCES)
+                self.assertEqual(len(clusters),2)
+
+    def test_same_accession_index_copies_deduplicate_despite_different_headlines(self):
+        rows=[filing('one'),filing('copy',title='ACME CORP Form 10-Q filed October 12, 2026',
+                                   company_cik='1',accession_number='000000000126000001')]
+        cluster=analyze_articles(rows,SOURCES)[0]
+        self.assertEqual(cluster['unique_count'],1)
+        self.assertEqual(cluster['duplicate_count'],1)
+        self.assertEqual(cluster['independent_sources'],1)
+
+    def test_filing_without_accession_uses_document_url_not_generic_title(self):
+        clusters=analyze_articles([filing('a',accession_number=None),filing('b',accession_number=None)],SOURCES)
+        self.assertEqual(len(clusters),2)
+        self.assertTrue(all(item['unique_count']==1 for item in clusters))
+
+    def test_generic_news_headline_cannot_collapse_two_filings(self):
+        rows=[article('news',title='10-Q - ACME CORP',kind='news',published_at='2026-10-12T20:30:00Z',
+                      entities=['ACME CORP'],topic_key='acme-earnings'),
+              filing('one',topic_key='acme-earnings'),
+              filing('two',topic_key='acme-earnings',accession_number='0000000001-26-000002')]
+        clusters=analyze_articles(rows,SOURCES)
+        self.assertEqual(sum(item['unique_count'] for item in clusters),3)
+        self.assertFalse(any(sum(article['kind']=='filing' for article in item['articles'])>1 for item in clusters))
+
     def test_paper_announcement_is_not_original_publication(self):
         row=article('paper',source_id='paper',kind='research',published_at=None,
                     announced_at='2026-10-12T04:00:00Z',date_basis='feed_announcement')

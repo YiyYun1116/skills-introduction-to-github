@@ -39,6 +39,9 @@ def initialize():
         );
         CREATE INDEX IF NOT EXISTS article_date ON articles(published_at);
         CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, payload TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS ingestion_runs (
+          id TEXT PRIMARY KEY, started_at TEXT NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS watchlist (
           id TEXT PRIMARY KEY, symbol TEXT NOT NULL, name TEXT NOT NULL,
           asset_class TEXT NOT NULL, region TEXT NOT NULL, note TEXT NOT NULL,
@@ -57,20 +60,71 @@ def initialize():
                            (json.dumps(article,ensure_ascii=False),row['id']))
 
 
-def save_articles(articles):
+def save_articles(articles, db=None):
+    if db is None:
+        with connection() as transaction:
+            return save_articles(articles, db=transaction)
+    counts = {'new_count':0, 'updated_count':0, 'unchanged_count':0, 'by_source':{}}
+    # Retrieval timestamps and transport changes do not make old content new.
+    def content(article):
+        return {key:value for key,value in article.items()
+                if key not in {'ingested_at','last_seen_at','retrieval_method'}}
+    for article in articles:
+        if article.get('is_demo'):
+            raise ValueError('演示数据不能写入实时数据库')
+        article = dict(article)
+        previous = db.execute('SELECT ingested_at,payload FROM articles WHERE id=?', (article['id'],)).fetchone()
+        category = ('new_count' if previous is None else
+                    'unchanged_count' if content(json.loads(previous['payload'])) == content(article) else 'updated_count')
+        counts[category] += 1
+        source_counts = counts['by_source'].setdefault(article['source_id'],
+            {'new_count':0,'updated_count':0,'unchanged_count':0})
+        source_counts[category] += 1
+        article['last_seen_at'] = article.get('ingested_at') or now()
+        article['ingested_at'] = previous['ingested_at'] if previous else article['last_seen_at']
+        db.execute('''INSERT INTO articles VALUES (?,?,?,?,?)
+          ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,
+          published_at=excluded.published_at''',
+          (article['id'], article['source_id'], article.get('published_at'),
+           article.get('ingested_at') or now(), json.dumps(article, ensure_ascii=False)))
+    return counts
+
+
+def begin_ingestion_run(record):
     with connection() as db:
-        for article in articles:
-            if article.get('is_demo'):
-                raise ValueError('演示数据不能写入实时数据库')
-            article = dict(article)
-            previous = db.execute('SELECT ingested_at FROM articles WHERE id=?', (article['id'],)).fetchone()
-            article['last_seen_at'] = article.get('ingested_at') or now()
-            article['ingested_at'] = previous['ingested_at'] if previous else article['last_seen_at']
-            db.execute('''INSERT INTO articles VALUES (?,?,?,?,?)
-              ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,
-              published_at=excluded.published_at''',
-              (article['id'], article['source_id'], article.get('published_at'),
-               article.get('ingested_at') or now(), json.dumps(article, ensure_ascii=False)))
+        db.execute('INSERT INTO ingestion_runs VALUES (?,?,?,?)',
+                   (record['id'],record['started_at'],record['status'],json.dumps(record,ensure_ascii=False)))
+
+
+def finish_ingestion_run(record, metadata, db=None):
+    """Commit source states and the run, optionally in the article transaction."""
+    if db is None:
+        with connection() as transaction:
+            return finish_ingestion_run(record, metadata, db=transaction)
+    db.execute('INSERT INTO ingestion_runs VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE '
+               'SET status=excluded.status,payload=excluded.payload',
+               (record['id'],record['started_at'],record['status'],json.dumps(record,ensure_ascii=False)))
+    db.execute('INSERT INTO metadata VALUES (?,?) ON CONFLICT(key) DO UPDATE SET payload=excluded.payload',
+               ('ingestion',json.dumps(metadata,ensure_ascii=False)))
+    db.execute('DELETE FROM ingestion_runs WHERE id NOT IN '
+               '(SELECT id FROM ingestion_runs ORDER BY started_at DESC LIMIT 100)')
+
+
+def list_ingestion_runs(limit=20):
+    with connection() as db:
+        rows = db.execute('SELECT payload FROM ingestion_runs ORDER BY started_at DESC LIMIT ?', (limit,)).fetchall()
+    return [json.loads(row['payload']) for row in rows]
+
+
+def recover_ingestion_runs():
+    """A previous process cannot still be collecting in our single-instance setup."""
+    with connection() as db:
+        for row in db.execute("SELECT payload FROM ingestion_runs WHERE status='running'").fetchall():
+            record = json.loads(row['payload'])
+            record.update(status='interrupted',finished_at=now(),
+                          error='上次采集因服务重启而中断；启动后会重新检查来源。')
+            db.execute('UPDATE ingestion_runs SET status=?,payload=? WHERE id=?',
+                       ('interrupted',json.dumps(record,ensure_ascii=False),record['id']))
 
 
 def list_articles(limit=2000):

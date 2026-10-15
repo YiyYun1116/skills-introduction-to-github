@@ -5,8 +5,10 @@ from __future__ import annotations
 import concurrent.futures
 import hashlib
 import html
+import http.client
 import re
 import socket
+import ssl
 import threading
 import time
 import urllib.error
@@ -20,6 +22,8 @@ from html.parser import HTMLParser
 
 MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
 REQUEST_TIMEOUT_SECONDS = 10
+MAX_FETCH_ATTEMPTS = 3
+MAX_RETRY_DELAY_SECONDS = 5
 USER_AGENT = "AtlasFinancialResearch/1.0 (public RSS and Atom reader)"
 _ARXIV_REQUEST_LOCK = threading.Lock()
 _ARXIV_LAST_REQUEST = 0.0
@@ -29,7 +33,7 @@ def _source(source_id, name, url, feed_url, region, description, *, kind="offici
             assets=("macro",), group=None, enabled=True):
     return {
         "id": source_id, "name": name, "url": url, "feed_url": feed_url,
-        "kind": kind, "tier": "academic" if kind == "research" else "primary",
+        "kind": kind, "tier": {"research": "academic", "news": "secondary"}.get(kind, "primary"),
         "region": region, "language": "en", "asset_classes": list(assets),
         "independence_group": group or source_id, "description": description,
         "enabled": enabled, "feed_verification": "unverified_network",
@@ -70,6 +74,22 @@ SOURCE_CATALOG = [
             "https://www.sec.gov/news/pressreleases.rss", "US",
             "证券监管与执法原始公告；包含上市公司、投资产品和数字资产监管事项。",
             assets=("equity", "options", "crypto"), group="sec"),
+    _source("sec_10k", "SEC EDGAR · 公司年报", "https://www.sec.gov/",
+            "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=10-K&owner=include&count=100&output=atom", "US",
+            "美国 EDGAR 最新 10-K、10-KT 过渡年报及修订申报索引，默认每轮最多读取 100 条，不是完整历史或全球公司覆盖；申报内容由公司负责，SEC 收录不代表担保。",
+            assets=("equity",), group="sec"),
+    _source("sec_10q", "SEC EDGAR · 公司季报", "https://www.sec.gov/",
+            "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=10-Q&owner=include&count=100&output=atom", "US",
+            "美国 EDGAR 最新 10-Q、10-QT 过渡季报及修订申报索引，默认每轮最多读取 100 条；接收时间不等于财报覆盖期间，未自动提取报表数值或回补完整历史。",
+            assets=("equity",), group="sec"),
+    _source("bbc_business", "BBC · 全球商业新闻", "https://www.bbc.co.uk/news/business",
+            "https://feeds.bbci.co.uk/news/business/rss.xml", "GLOBAL",
+            "BBC 英文商业新闻标题与摘要，属媒体二手报道；覆盖由公开订阅决定，需结合原始公告核验。",
+            kind="news", assets=("macro", "equity"), group="bbc"),
+    _source("guardian_business", "The Guardian · 全球商业新闻", "https://www.theguardian.com/business",
+            "https://www.theguardian.com/business/rss", "GLOBAL",
+            "Guardian 英文商业新闻标题与摘要，属媒体二手报道；区域版订阅可能偏重英国、美国及国际经济。",
+            kind="news", assets=("macro", "equity"), group="guardian"),
 ]
 
 # These statements record a completed read-only probe, not future uptime promises.
@@ -93,6 +113,21 @@ for _catalog_source in SOURCE_CATALOG:
         _catalog_source["verification_note"] = (
             "已验证 RSS 及官方 Atom 历史接口；RSS 无当期更新时读取最近论文，保留真实发表时间。"
         )
+    if _catalog_source["id"] in {"sec_10k", "sec_10q"}:
+        _catalog_source.update({
+            "content_kind": "filing", "filing_form": "10-K" if _catalog_source["id"] == "sec_10k" else "10-Q",
+            "fetch_limit": 100, "coverage_scope": "recent_feed_only",
+            "feed_verification": "verified_format", "feed_verified_on": "2026-10-13",
+            "verification_note": "已实测 SEC 官方 Atom 申报索引；仅覆盖最近条目，非完整财报历史。",
+        })
+    if _catalog_source["id"] in {"bbc_business", "guardian_business"}:
+        _catalog_source.update({
+            "fetch_limit": 100, "coverage_scope": "recent_feed_only",
+            "feed_verification": "verified_format", "feed_verified_on": "2026-10-15",
+            "verification_note": "已实测媒体公开 RSS；可读取不代表每项报道已经独立核实。",
+            "article_hosts": (["www.bbc.co.uk", "bbc.co.uk", "www.bbc.com", "bbc.com"]
+                              if _catalog_source["id"] == "bbc_business" else ["www.theguardian.com"]),
+        })
 
 _SOURCE_BY_ID = {source["id"]: source for source in SOURCE_CATALOG}
 APPROVED_FEED_HOSTS = frozenset(
@@ -103,6 +138,16 @@ APPROVED_FEED_HOSTS = frozenset(
 
 class SourceFetchError(RuntimeError):
     """A safe public error that does not include proxy URLs or credentials."""
+
+    def __init__(self, message, *, error_type="parse_error", attempts=1, retryable=False,
+                 http_status=None, retry_after_seconds=None, retry_errors=None):
+        super().__init__(message)
+        self.error_type = error_type
+        self.attempts = attempts
+        self.retryable = retryable
+        self.http_status = http_status
+        self.retry_after_seconds = retry_after_seconds
+        self.retry_errors = list(retry_errors or [])
 
 
 def _utc_now():
@@ -216,6 +261,10 @@ def _paper_metadata(item, source):
 
 def _article_dates(item, source, summary, *, is_atom):
     """Keep a paper's first publication distinct from feed announcement/revision dates."""
+    if source.get("content_kind") == "filing":
+        accepted_at = _published_at(_child_text(item, "updated"))
+        return {"published_at": None, "accepted_at": accepted_at, "announced_at": accepted_at,
+                "date_basis": "filing_accepted"}
     if source["id"].startswith("arxiv_"):
         if is_atom:
             return {
@@ -241,6 +290,31 @@ def _article_dates(item, source, summary, *, is_atom):
     return {"published_at": _published_at(_child_text(item, "published", "pubdate", "date"))}
 
 
+def _filing_metadata(item, title, summary, source):
+    if source.get("content_kind") != "filing":
+        return {}
+    forms = [node.attrib.get("term", "") for node in _children(item, {"category"})]
+    form = next((form for form in forms if re.fullmatch(r"10-[KQ]T?(?:/A)?", form)), None)
+    # A query filter is not evidence that a specific returned entry is the requested form.
+    if not form:
+        return {}
+    company_match = re.match(r"^10-[KQ]T?(?:/A)?\s+-\s+(.+?)\s+\((\d{10})\)(?:\s|$)", title)
+    accession = re.search(r"\b\d{10}-\d{2}-\d{6}\b", summary)
+    filing_day = re.search(r"\bFiled:\s*(\d{4}-\d{2}-\d{2})\b", summary)
+    metadata = {"kind": "filing", "filing_form": form, "asset_classes": ["equity"],
+                "tags": ["company_filings"], "company_name": None, "company_cik": None,
+                "accession_number": accession.group(0) if accession else None, "filing_date": None}
+    if company_match:
+        metadata.update({"company_name": company_match.group(1), "company_cik": company_match.group(2),
+                         "entities": [company_match.group(1)]})
+    if filing_day:
+        try:
+            metadata["filing_date"] = datetime.strptime(filing_day.group(1), "%Y-%m-%d").date().isoformat()
+        except ValueError:
+            pass
+    return metadata
+
+
 def _safe_article_url(value, source):
     value = str(value or "").strip()
     if not value or len(value) > 2048 or any(ord(char) < 32 for char in value):
@@ -249,6 +323,7 @@ def _safe_article_url(value, source):
     try:
         parsed = urllib.parse.urlsplit(value)
         hosts = {urllib.parse.urlsplit(source[key]).hostname for key in ("url", "feed_url")}
+        hosts.update(source.get("article_hosts", []))
         if source["id"].startswith("arxiv_"):
             hosts |= {"arxiv.org", "export.arxiv.org", "rss.arxiv.org"}
         if (parsed.scheme not in {"https", "http"} or parsed.hostname not in hosts
@@ -379,6 +454,7 @@ def parse_feed(xml, source, limit=25):
         article.update(_article_dates(item, source, summary, is_atom=_local_name(root.tag) == "feed"))
         article.update(classify_article(title, summary, source))
         article.update(_paper_metadata(item, source))
+        article.update(_filing_metadata(item, title, summary, source))
         articles.append(article)
         if len(articles) >= limit:
             break
@@ -393,7 +469,7 @@ def _validate_feed_url(url):
                 or any(ord(char) < 32 for char in url)):
             raise ValueError
     except ValueError:
-        raise SourceFetchError("拒绝非 HTTPS 或未批准域名的订阅/重定向地址。") from None
+        raise SourceFetchError("拒绝非 HTTPS 或未批准域名的订阅/重定向地址。", error_type="blocked_url") from None
 
 
 class _ApprovedRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -402,7 +478,17 @@ class _ApprovedRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def _read_feed(source):
+def _retry_after_seconds(headers):
+    value = str(headers.get("Retry-After", "")).strip()[:128] if headers else ""
+    if re.fullmatch(r"\d{1,10}", value):
+        return int(value)
+    timestamp = _published_at(value)
+    if timestamp:
+        return max(0, (datetime.fromisoformat(timestamp.replace("Z", "+00:00")) - datetime.now(timezone.utc)).total_seconds())
+    return None
+
+
+def _read_feed_once(source):
     _validate_feed_url(source["feed_url"])
     request = urllib.request.Request(source["feed_url"], headers={
         "User-Agent": USER_AGENT,
@@ -418,19 +504,87 @@ def _read_feed(source):
             except (TypeError, ValueError):
                 length = 0
             if length > MAX_PAYLOAD_BYTES:
-                raise SourceFetchError("订阅内容超过 2 MB 上限。")
+                raise SourceFetchError("订阅内容超过 2 MB 上限。", error_type="payload_too_large")
             payload = response.read(MAX_PAYLOAD_BYTES + 1)
             if len(payload) > MAX_PAYLOAD_BYTES:
-                raise SourceFetchError("订阅内容超过 2 MB 上限。")
+                raise SourceFetchError("订阅内容超过 2 MB 上限。", error_type="payload_too_large")
             return payload
     except urllib.error.HTTPError as exc:
-        raise SourceFetchError(f"来源返回 HTTP {exc.code}；未生成替代新闻。") from None
+        error_type = {403: "access_denied", 404: "not_found", 408: "timeout", 429: "rate_limited"}.get(
+            exc.code, "server_error" if 500 <= exc.code <= 599 else "http_error"
+        )
+        raise SourceFetchError(f"来源返回 HTTP {exc.code}；未生成替代新闻。", error_type=error_type,
+                               retryable=exc.code in {408, 429} or 500 <= exc.code <= 599,
+                               http_status=exc.code, retry_after_seconds=_retry_after_seconds(exc.headers)) from None
     except (socket.timeout, TimeoutError):
-        raise SourceFetchError("来源请求超时；未生成替代新闻。") from None
-    except urllib.error.URLError:
-        raise SourceFetchError("无法连接来源：请检查网络白名单、TLS 或来源可用性。") from None
+        raise SourceFetchError("来源请求超时；未生成替代新闻。", error_type="timeout", retryable=True) from None
+    except ssl.SSLError:
+        raise SourceFetchError("TLS 校验或握手失败；保留安全校验，请检查来源证书。", error_type="tls_error") from None
+    except urllib.error.URLError as exc:
+        reason = exc.reason
+        # Reason strings are inspected locally only; none is exposed in API output.
+        if isinstance(reason, ssl.SSLError) or "CERTIFICATE_VERIFY_FAILED" in str(reason):
+            raise SourceFetchError("TLS 校验失败；保留证书校验。", error_type="tls_error") from None
+        if re.search(r"Tunnel connection failed:\s*(403|404)\b", str(reason)):
+            raise SourceFetchError("网络代理拒绝连接；请检查环境域名白名单。", error_type="proxy_access_denied") from None
+        if isinstance(reason, (socket.timeout, TimeoutError)):
+            raise SourceFetchError("来源请求超时；未生成替代新闻。", error_type="timeout", retryable=True) from None
+        raise SourceFetchError("暂时无法连接来源；请检查网络或来源可用性。", error_type="network_error", retryable=True) from None
+    except http.client.IncompleteRead:
+        raise SourceFetchError("来源响应中断，未收到完整订阅。", error_type="incomplete_response", retryable=True) from None
+    except PermissionError:
+        raise SourceFetchError("环境拒绝访问来源。", error_type="access_denied") from None
     except OSError:
-        raise SourceFetchError("来源连接失败；请检查网络配置。") from None
+        raise SourceFetchError("来源连接失败；请检查网络配置。", error_type="network_error", retryable=True) from None
+
+
+class _FeedPayload(bytes):
+    def __new__(cls, payload, attempts, retry_errors):
+        value = super().__new__(cls, payload)
+        value.attempts = attempts
+        value.retry_errors = list(retry_errors)
+        return value
+
+
+def _wait_for_arxiv_api_slot():
+    global _ARXIV_LAST_REQUEST
+    with _ARXIV_REQUEST_LOCK:
+        remaining = 3.0 - (time.monotonic() - _ARXIV_LAST_REQUEST)
+        if remaining > 0:
+            time.sleep(remaining)
+        _ARXIV_LAST_REQUEST = time.monotonic()
+
+
+def _read_feed(source, max_attempts=MAX_FETCH_ATTEMPTS):
+    """Retry transient transport failures only, with at most three total requests."""
+    retry_errors = []
+    max_attempts = max(1, min(MAX_FETCH_ATTEMPTS, max_attempts))
+    for attempt in range(1, max_attempts + 1):
+        if source["feed_url"].startswith("https://export.arxiv.org/api/"):
+            _wait_for_arxiv_api_slot()
+        try:
+            return _FeedPayload(_read_feed_once(source), attempt, retry_errors)
+        except SourceFetchError as exc:
+            exc.attempts = attempt
+            exc.retry_errors = list(retry_errors)
+            if not exc.retryable or attempt >= max_attempts:
+                raise
+            delay = max(0.5 * (2 ** (attempt - 1)), exc.retry_after_seconds or 0)
+            # Respect a long server Retry-After by leaving retry to the next sync,
+            # rather than retrying earlier or blocking a worker for minutes.
+            if delay > MAX_RETRY_DELAY_SECONDS:
+                raise
+            retry_errors.append({"attempt": attempt, "error_type": exc.error_type, "http_status": exc.http_status})
+            time.sleep(delay)
+
+
+def _parse_fetched_feed(payload, source, limit):
+    try:
+        return parse_feed(payload, source, limit=limit)
+    except SourceFetchError as exc:
+        exc.attempts = getattr(payload, "attempts", 1)
+        exc.retry_errors = getattr(payload, "retry_errors", [])
+        raise
 
 
 class _FetchedArticles(list):
@@ -440,33 +594,50 @@ class _FetchedArticles(list):
         self.retrieval = retrieval
 
 
-def _read_arxiv_history(source):
-    global _ARXIV_LAST_REQUEST
-    # arXiv asks API clients to leave at least three seconds between requests.
-    # The lock is shared across research feeds and manual/background invocations.
-    with _ARXIV_REQUEST_LOCK:
-        remaining = 3.0 - (time.monotonic() - _ARXIV_LAST_REQUEST)
-        if remaining > 0:
-            time.sleep(remaining)
-        _ARXIV_LAST_REQUEST = time.monotonic()
-    return _read_feed(dict(source, feed_url=source["history_feed_url"]))
+def _read_arxiv_history(source, max_attempts=MAX_FETCH_ATTEMPTS):
+    # API request pacing is applied to every attempt in _read_feed.
+    return _read_feed(dict(source, feed_url=source["history_feed_url"]), max_attempts=max_attempts)
 
 
-def fetch_source(source_id, limit=25):
+def fetch_source(source_id, limit=None):
     if not isinstance(source_id, str) or source_id not in _SOURCE_BY_ID:
         raise ValueError("Unknown source_id")
+    source = _SOURCE_BY_ID[source_id]
+    if limit is None:
+        limit = source.get("fetch_limit", 25)
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
         raise ValueError("limit must be between 1 and 100")
-    source = _SOURCE_BY_ID[source_id]
-    articles = parse_feed(_read_feed(source), source, limit=limit)
-    retrieval = {"retrieval_method": "rss", "history_fallback": False}
-    if not articles and source.get("history_feed_url"):
+    payload = _read_feed(source)
+    articles = _parse_fetched_feed(payload, source, limit)
+    attempts = getattr(payload, "attempts", 1)
+    retry_errors = list(getattr(payload, "retry_errors", []))
+    retrieval = {"retrieval_method": "atom" if source.get("content_kind") == "filing" else "rss", "history_fallback": False,
+                 "attempts": attempts, "retry_count": len(retry_errors), "retry_errors": retry_errors,
+                 "error_type": None}
+    if not articles and source.get("history_feed_url") and attempts >= MAX_FETCH_ATTEMPTS:
+        retrieval["detail"] = "RSS 无当期更新；本轮最多 3 次请求预算已用尽，暂未读取历史论文。"
+    elif not articles and source.get("history_feed_url"):
         try:
-            articles = parse_feed(_read_arxiv_history(source), source, limit=limit)
+            history = _read_arxiv_history(source, max_attempts=MAX_FETCH_ATTEMPTS - attempts)
+            articles = _parse_fetched_feed(history, source, limit)
         except SourceFetchError as exc:
-            raise SourceFetchError("RSS 无当期论文；官方历史接口未能读取：" + str(exc)) from None
-        retrieval = {"retrieval_method": "atom_history", "history_fallback": True,
+            history_errors = [dict(error, attempt=attempts + error["attempt"]) for error in exc.retry_errors]
+            raise SourceFetchError("RSS 无当期论文；官方历史接口未能读取：" + str(exc), error_type=exc.error_type,
+                                   attempts=attempts + exc.attempts, retryable=exc.retryable, http_status=exc.http_status,
+                                   retry_after_seconds=exc.retry_after_seconds, retry_errors=retry_errors + history_errors) from None
+        retry_errors += [dict(error, attempt=attempts + error["attempt"]) for error in getattr(history, "retry_errors", [])]
+        retrieval = {"retrieval_method": "atom_history", "history_fallback": True, "error_type": None,
+                     "attempts": attempts + getattr(history, "attempts", 1),
+                     "retry_count": len(retry_errors), "retry_errors": retry_errors,
                      "detail": "RSS 无当期更新；使用官方 Atom 接口的最近历史论文，非今日新发布。"}
+    if source.get("content_kind") == "filing":
+        retrieval.update({"requested_limit": limit, "limit_reached": len(articles) >= limit,
+                          "coverage_scope": "recent_feed_only",
+                          "detail": f"仅采集 SEC 最新申报索引，最多 {limit} 条；达到上限时可能遗漏更多条目。未回补完整历史或下载财报全文，接收时间不等于报告期。"})
+    elif source["kind"] == "news":
+        retrieval.update({"requested_limit": limit, "limit_reached": len(articles) >= limit,
+                          "coverage_scope": "recent_feed_only",
+                          "detail": f"仅采集公开媒体 RSS 的标题及摘要，最多 {limit} 条；未抓取付费全文或回补完整历史，媒体报道需结合原始来源核验。"})
     for article in articles:
         article["retrieval_method"] = retrieval["retrieval_method"]
     return _FetchedArticles(articles, retrieval)
@@ -489,11 +660,15 @@ def fetch_all(source_ids=None):
                               **getattr(articles, "retrieval", {})}
         except SourceFetchError as exc:
             return [], {"source_id": source_id, "status": "error", "article_count": 0,
-                        "error": str(exc), "checked_at": _utc_now()}
+                        "error": str(exc), "checked_at": _utc_now(), "attempts": exc.attempts,
+                        "error_type": exc.error_type, "http_status": exc.http_status,
+                        "retry_count": len(exc.retry_errors), "retry_errors": exc.retry_errors,
+                        "retry_after_seconds": exc.retry_after_seconds}
         except Exception:
             # No remote exception text (including proxy credentials) enters the public API.
             return [], {"source_id": source_id, "status": "error", "article_count": 0,
-                        "error": "订阅处理失败；未生成替代新闻。", "checked_at": _utc_now()}
+                        "error": "订阅处理失败；未生成替代新闻。", "checked_at": _utc_now(),
+                        "attempts": 1, "error_type": "internal_error", "retry_count": 0, "retry_errors": []}
 
     articles, results = [], []
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:

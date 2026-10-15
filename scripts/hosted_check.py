@@ -64,6 +64,10 @@ with tempfile.TemporaryDirectory(prefix='signal-atlas-hosted-') as directory:
                 errors=[]
                 page.on('pageerror',lambda error:errors.append(str(error)))
                 page.goto(base,wait_until='networkidle')
+                expect(page.get_by_text('等待第一条真实信息',exact=True)).to_be_visible()
+                expect(page.locator('#mode-label')).to_contain_text('LIVE')
+                expect(page.locator('.update-bar')).to_contain_text('自动更新已关闭')
+                page.locator('#mode-switch').click()
                 expect(page.locator('.topic-card').first).to_be_visible()
                 expect(page.locator('#mode-label')).to_contain_text('DEMO')
                 assert not page.evaluate('document.documentElement.scrollWidth > innerWidth')
@@ -73,7 +77,7 @@ with tempfile.TemporaryDirectory(prefix='signal-atlas-hosted-') as directory:
                 process=launch(environment,log,base)
                 assert any(item['symbol']=='HOSTED-CHECK' for item in context.request.get(base+'/api/watchlist').json()['items'])
                 page.reload(wait_until='networkidle')
-                expect(page.locator('.topic-card').first).to_be_visible()
+                expect(page.get_by_text('等待第一条真实信息',exact=True)).to_be_visible()
                 assert not errors,errors
                 browser.close()
             print(json.dumps({'status':'passed','checks':['clean hosted startup from different directory','PORT binding','public health check','private API denies anonymous access','mobile authenticated page','responsive layout','persistent watchlist after process restart','authenticated reload']},ensure_ascii=False))

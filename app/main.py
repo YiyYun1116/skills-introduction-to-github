@@ -2,10 +2,8 @@
 import asyncio
 import csv
 import io
-import logging
 import os
 import sqlite3
-import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
@@ -21,30 +19,11 @@ from .access import check_access, validate_access_config
 from .analysis import analyze_articles, market_summary
 from .briefing import build_briefing
 from .demo import DEMO_SOURCES, demo_articles
-from .sources import SOURCE_CATALOG, fetch_all
+from .diagnostics import build_diagnostics
+from .ingestion import collector
+from .sources import SOURCE_CATALOG
 
-log = logging.getLogger('signal_atlas')
 ROOT = Path(__file__).resolve().parent
-INGEST_LOCK = threading.Lock()
-
-
-def run_ingestion(source_ids=None):
-    try:
-        result = fetch_all(source_ids)
-        storage.save_articles(result['articles'])
-        previous = storage.get_metadata('ingestion', {}).get('results', [])
-        merged = {row['source_id']: row for row in previous}
-        merged.update({row['source_id']: row for row in result['results']})
-        storage.set_metadata('ingestion', {'last_run':storage.now(), 'results':list(merged.values()),
-                                         'last_run_results':result['results']})
-    except Exception:
-        log.exception('Ingestion failed')
-        previous = storage.get_metadata('ingestion', {})
-        storage.set_metadata('ingestion', {'last_run':storage.now(),'results':previous.get('results',[]),
-                                         'last_run_results':[],
-                                         'error':'采集失败；已有数据已保留，请查看服务日志。'})
-    finally:
-        INGEST_LOCK.release()
 
 
 def sync_minutes():
@@ -57,23 +36,16 @@ def sync_minutes():
     return 0 if minutes == 0 else max(5,minutes)
 
 
-async def schedule_ingestion(minutes):
-    interval = minutes * 60
-    await asyncio.sleep(3)
-    while True:
-        if INGEST_LOCK.acquire(blocking=False):
-            await asyncio.to_thread(run_ingestion)
-        await asyncio.sleep(interval)
-
-
 @asynccontextmanager
 async def lifespan(app):
     validate_access_config()
     storage.initialize()
+    storage.recover_ingestion_runs()
     task = None
     minutes = sync_minutes()
+    collector.configure(minutes)
     if minutes:
-        task = asyncio.create_task(schedule_ingestion(minutes))
+        task = asyncio.create_task(collector.run_schedule(minutes))
     yield
     if task:
         task.cancel()
@@ -111,15 +83,14 @@ def health():
 
 def build_dashboard(mode=None):
     live = storage.list_articles()
-    selected = mode or ('live' if live else 'demo')
+    selected = mode or 'live'
     demo = selected == 'demo'
     articles = demo_articles() if demo else live
     sources = SOURCE_CATALOG + DEMO_SOURCES if demo else SOURCE_CATALOG
     clusters = analyze_articles(articles, sources)
     for cluster in clusters:
         cluster['briefing'] = build_briefing(cluster)
-    ingestion = storage.get_metadata('ingestion', {'last_run':None,'results':[]})
-    ingestion['running'] = INGEST_LOCK.locked()
+    ingestion = collector.status()
     status_by_id = {item['source_id']:item for item in ingestion.get('results',[])}
     catalog = [dict(source, status=status_by_id.get(source['id'],{}).get('status','not_checked'),
                     last_check=status_by_id.get(source['id'])) for source in sources]
@@ -132,6 +103,7 @@ def build_dashboard(mode=None):
                  'primary_sources':len({a['independence_group'] for a in traced_originals if a['source_tier']=='primary'}),
                  'independent_sources':len({a['independence_group'] for a in traced_originals})},
         'market_summary':market_summary(clusters),'ingestion':ingestion,
+        'diagnostics':build_diagnostics(live,ingestion),
         'coverage':{'asset_classes':['equity','futures','options','crypto','macro'],
                     'regions':['US','CN','HK','EU','GLOBAL'], 'quotes_connected':False,
                     'research':'公开论文订阅；未建立作者权威排名，预印本不等于同行评审。',
@@ -149,6 +121,11 @@ def dashboard(mode: Literal['live','demo'] | None = None):
     return build_dashboard(mode)
 
 
+@app.get('/api/diagnostics')
+def diagnostics():
+    return build_diagnostics(storage.list_articles(),collector.status())
+
+
 class IngestRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
     source_ids: list[str] | None = Field(default=None,max_length=20)
@@ -159,9 +136,9 @@ def ingest(body: IngestRequest, tasks: BackgroundTasks):
     known = {s['id'] for s in SOURCE_CATALOG}
     if body.source_ids is not None and (not body.source_ids or not set(body.source_ids).issubset(known)):
         raise HTTPException(422,'请选择有效的数据源')
-    if not INGEST_LOCK.acquire(blocking=False):
+    if not collector.reserve():
         return {'status':'running'}
-    tasks.add_task(run_ingestion,body.source_ids)
+    tasks.add_task(collector.run_reserved,body.source_ids)
     return {'status':'started'}
 
 
@@ -218,7 +195,7 @@ def export(mode: Literal['live','demo'] | None = None):
     for cluster in data['clusters']:
         writer.writerow([csv_safe(v) for v in [data['mode'],cluster['title'],cluster['verification']['label'],
                          cluster['independent_sources'],cluster['duplicate_count'],cluster['sentiment']['label'],
-                         '订阅公告（非原始发表）' if cluster.get('latest_date_basis')=='feed_announcement' else '发布',
+                         {'feed_announcement':'订阅公告（非原始发表）','filing_accepted':'SEC 受理时间（非报告期）'}.get(cluster.get('latest_date_basis'),'发布'),
                          cluster.get('latest_at'), ' | '.join(a['url'] for a in cluster['articles'])]])
     return Response('\ufeff'+stream.getvalue(), media_type='text/csv; charset=utf-8',
                     headers={'Content-Disposition':f'attachment; filename="signal-atlas-{data["mode"]}.csv"'})

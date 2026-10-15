@@ -25,7 +25,8 @@ class AppTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_dashboard_demo_and_empty_live_are_separate(self):
-        demo = self.client.get('/api/dashboard').json()
+        self.assertEqual(self.client.get('/api/dashboard').json()['mode'],'live')
+        demo = self.client.get('/api/dashboard?mode=demo').json()
         self.assertEqual(demo['mode'],'demo')
         self.assertGreater(demo['stats']['clusters'],3)
         self.assertGreater(demo['stats']['duplicates'],0)
@@ -66,7 +67,7 @@ class AppTests(unittest.TestCase):
         source_id=SOURCE_CATALOG[0]['id']
         result={'articles':[],'results':[{'source_id':source_id,'status':'error','article_count':0,
                                          'error':'network unavailable','checked_at':storage.now()}]}
-        with patch('app.main.fetch_all',return_value=result):
+        with patch('app.ingestion.fetch_all',return_value=result):
             self.assertEqual(self.client.post('/api/ingest',json={'source_ids':[source_id]}).status_code,202)
         data=self.client.get('/api/dashboard?mode=live').json()
         self.assertFalse(data['ingestion']['running'])
@@ -91,6 +92,15 @@ class AppTests(unittest.TestCase):
         response=self.client.get('/api/health')
         self.assertEqual(response.json()['status'],'ok')
         self.assertIn("frame-ancestors 'none'",response.headers['Content-Security-Policy'])
+
+    def test_system_checks_use_live_data_even_in_demo_view(self):
+        demo = self.client.get('/api/dashboard?mode=demo').json()
+        checks = {row['id']:row for row in demo['diagnostics']['checks']}
+        self.assertEqual(checks['live_data']['status'],'warning')
+        self.assertIn('暂为空',checks['live_data']['detail'])
+        response = self.client.get('/api/diagnostics')
+        self.assertEqual(response.status_code,200)
+        self.assertEqual(response.json()['summary'],demo['diagnostics']['summary'])
 
     def test_repeat_fetch_preserves_first_seen_for_undated_article(self):
         item={'id':'undated','source_id':'fed_press','title':'Undated article','ingested_at':'2026-01-01T00:00:00Z'}

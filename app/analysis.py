@@ -116,8 +116,25 @@ def _same_period(left, right):
     return abs(first - second) <= 7 * 86400
 
 
+def _same_filing(left, right):
+    """Match document identities, never a generic quarterly-report headline."""
+    one, two = left["_analysis"], right["_analysis"]
+    if one["filing_key"] != two["filing_key"]:
+        return False
+    for field in ("filing_form", "reporting_period"):
+        if one[field] and two[field] and one[field] != two[field]:
+            return False
+    if one["company_cik"] and two["company_cik"]:
+        return one["company_cik"] == two["company_cik"]
+    return not (one["company_name"] and two["company_name"] and one["company_name"] != two["company_name"])
+
+
 def _duplicate(left, right):
     if left["is_demo"] != right["is_demo"]:
+        return False
+    if left["kind"] == right["kind"] == "filing":
+        return _same_filing(left, right)
+    if "filing" in (left["kind"], right["kind"]) and left["canonical_url"] != right["canonical_url"]:
         return False
     # A recurring headline about a different period is a separate observation.
     if not _same_period(left, right):
@@ -155,6 +172,8 @@ def _duplicate(left, right):
 def _related(left, right):
     if left["is_demo"] != right["is_demo"]:
         return False
+    if left["kind"] == right["kind"] == "filing":
+        return _same_filing(left, right)
     if left["topic_key"] and right["topic_key"]:
         return left["topic_key"] == right["topic_key"]
     if not _same_period(left, right):
@@ -182,6 +201,8 @@ def _source_map(sources):
 def _source_domain_matches(url, source):
     if not url:
         return False
+    if urlsplit(url).hostname in source.get('article_hosts', []):
+        return True
     expected = []
     for field in ("url", "feed_url"):
         source_url = canonicalize_url(source.get(field))
@@ -200,11 +221,18 @@ def _prepare(article, sources):
     url = canonicalize_url(article.get("url"))
     published = _timestamp(article.get("published_at"))
     announced = _timestamp(article.get("announced_at"))
-    activity = announced or published
+    accepted = _timestamp(article.get("accepted_at"))
+    kind = _text(article.get("kind")) or "news"
+    filing_activity = (accepted or (announced if article.get("date_basis") == "filing_accepted" else "")) if kind == "filing" else ""
+    activity = filing_activity or announced or published
+    activity_basis = "filing_accepted" if filing_activity else "feed_announcement" if announced else "publication"
     demo = bool(article.get("is_demo", False))
     identity = "\n".join((source_id, url, title, published, str(demo)))
     identifier = _text(article.get("id")) or "a-" + hashlib.sha256(identity.encode()).hexdigest()[:16]
     normalized_title = normalize_title(title)
+    accession = re.sub(r"[^0-9]", "", _text(article.get("accession_number")))
+    filing_key = "accession:" + accession if len(accession) == 18 else "url:" + url if url else "id:" + identifier
+    company_cik = _text(article.get("company_cik")).lstrip("0")
     # Per-call features are released with the result computation. A global
     # cache of thousands of long news summaries would retain too much memory.
     features = {
@@ -216,6 +244,10 @@ def _prepare(article, sources):
         "tags": set(map(_fold, _strings(article.get("tags")))),
         "numeric_skeleton": re.sub(r"[-+]?\d+(?:[.,]\d+)*", "#", normalized_title),
         "published_epoch": datetime.fromisoformat(activity.replace("Z", "+00:00")).timestamp() if activity else None,
+        "filing_key": filing_key, "company_cik": company_cik,
+        "company_name": _fold(article.get("company_name")),
+        "filing_form": _fold(article.get("filing_form")),
+        "reporting_period": _fold(article.get("reporting_period") or article.get("report_period") or article.get("period_of_report")),
     }
     return {
         **article,
@@ -227,14 +259,14 @@ def _prepare(article, sources):
         "independence_group": _text(source.get("independence_group")) or source_id or "unknown",
         "source_known": bool(source),
         "source_domain_match": _source_domain_matches(url, source),
-        "published_at": published, "announced_at": announced, "activity_at": activity,
-        "activity_date_basis": "feed_announcement" if announced else "publication",
+        "published_at": published, "announced_at": announced, "accepted_at": accepted, "activity_at": activity,
+        "activity_date_basis": activity_basis,
         "ingested_at": _timestamp(article.get("ingested_at")),
         "language": _text(article.get("language")) or "und",
         "asset_classes": _strings(article.get("asset_classes")),
         "regions": _strings(article.get("regions")), "entities": _strings(article.get("entities")),
         "tags": _strings(article.get("tags")), "topic_key": _text(article.get("topic_key")),
-        "kind": _text(article.get("kind")) or "news", "is_demo": demo,
+        "kind": kind, "is_demo": demo,
         "duplicate_of": None,
         "_analysis": features,
     }
@@ -317,11 +349,14 @@ def _verification(articles, independent_count, conflicts, demo):
     else:
         status, label, score = "limited", "单来源线索 · 待核验", 38
         explanation = "可追溯来源有限，需要寻找原始材料和独立报道。"
-    if any(not article["published_at"] for article in articles):
+    if any(not article["published_at"] and article["activity_date_basis"] != "filing_accepted" for article in articles):
         score = max(0, score - 8)
         limitations.append("部分条目缺少有效发布时间，无法确认信息时效。")
-    if any(article.get("announced_at") for article in articles):
+    if any(article["kind"] == "research" and article["activity_date_basis"] == "feed_announcement" for article in articles):
         limitations.append("论文订阅公告日期可能代表修订或交叉收录，不等于原始发表日期；仅用于活动排序。")
+    if any(article["kind"] == "filing" for article in articles):
+        limitations.append("SEC 申报受理时间不等于报告期末或财报首次发布日；申报日期也不能用于推算所属季度。")
+        limitations.append("当前申报材料为索引或摘要，尚未提取核对财务报表正文；SEC 收录不代表财务数字已获监管认可或独立核实。")
     if len(traceable) != len(articles):
         score = max(0, score - 10)
         limitations.append("部分条目来源未登记、缺少有效原文链接或链接域名不匹配来源目录。")
@@ -342,7 +377,13 @@ def scenario_for_cluster(cluster):
     asset_classes = set(cluster.get("asset_classes", []))
     articles = cluster.get("articles", [])
     research_only = bool(articles) and all(article.get("kind") == "research" for article in articles)
-    if research_only:
+    filing_present = any(article.get("kind") == "filing" for article in articles)
+    if filing_present:
+        bull = "只有在申报正文确认营收、利润及经营现金流改善，并核对报告期间和可比口径后，才可讨论公司基本面改善；当前索引不能支持这一结论。"
+        base = "目前只确认存在申报索引线索，尚未核对财务数字、报告期及管理层讨论，暂不判断业绩变化或股票方向。"
+        bear = "若正文显示盈利质量下降、现金流不足或重大风险增加，需进一步评估；这些情况尚未由当前索引证实。"
+        watch = ["公司名称、CIK 与申报编号是否对应", "10-K / 10-Q 正文及报告期末", "营收、利润、现金流及单位和同比口径", "修订申报、重述、审计意见与风险因素"]
+    elif research_only:
         bull = "若样本外检验、可复现方法及独立研究支持论文结论，相关方法可能帮助理解风险或改进研究流程；不能直接推出资产涨跌。"
         base = "若结论目前仅在特定样本和假设下成立，保留为研究线索，并核对方法、数据和适用市场。"
         bear = "若复现失败、存在前视或选择偏差，或忽略交易成本和流动性约束，结论的实际适用性可能显著下降。"
@@ -398,25 +439,31 @@ def analyze_articles(articles, sources):
 
     representatives = []
     duplicate_buckets = {}
+    filing_buckets = {}
     copies = {}
     for article in records:
         features = article["_analysis"]
         bucket_key = (article["is_demo"], features["numbers"], features["countries"])
         candidates = duplicate_buckets.setdefault(bucket_key, [])
-        original = next((prior for prior in candidates if _duplicate(article, prior)), None)
+        filing_candidates = filing_buckets.setdefault((article["is_demo"], features["filing_key"]), []) if article["kind"] == "filing" else []
+        original = next((prior for prior in filing_candidates + candidates if _duplicate(article, prior)), None)
         if original:
             article["duplicate_of"] = original["id"]
             copies[(original["id"], original["is_demo"])].append(article)
         else:
             representatives.append(article)
             candidates.append(article)
+            if article["kind"] == "filing":
+                filing_candidates.append(article)
             copies[(article["id"], article["is_demo"])] = []
 
     groups = []
     for article in representatives:
         # Check against the stable group representative; do not let a vague
         # bridge item merge two otherwise unrelated topics transitively.
-        group = next((group for group in groups if _related(article, group[0])), None)
+        group = next((group for group in groups if _related(article, group[0]) and
+                      all(article["kind"] != "filing" or prior["kind"] != "filing" or _same_filing(article, prior)
+                          for prior in group)), None)
         if group is None:
             groups.append([article])
         else:
@@ -432,6 +479,8 @@ def analyze_articles(articles, sources):
         latest_article = max(originals, key=lambda article: article["activity_at"])
         topic_keys = sorted({article["topic_key"] for article in originals if article["topic_key"]})
         stable_key = ("demo:" if lead["is_demo"] else "live:") + (topic_keys[0] if topic_keys else "|".join(sorted(article["id"] for article in originals)))
+        if topic_keys and any(article["kind"] == "filing" for article in originals):
+            stable_key += ":filing:" + "|".join(sorted(article["id"] for article in originals if article["kind"] == "filing"))
         evidence = []
         for article in originals:
             evidence.append({"claim": article["title"], "supporting_article_ids": [article["id"]],
